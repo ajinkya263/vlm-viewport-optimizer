@@ -1,0 +1,62 @@
+name: CI
+
+# Run on every push to main and on every PR that targets main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so a rapid push stream doesn't queue up.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # Headless OpenCV (opencv-python-headless) dlopens a couple of shared libs
+      # at runtime even though it ships no GUI. Install them explicitly so cv2
+      # imports cleanly on the minimal GitHub runner image.
+      - name: Install system libraries for headless OpenCV
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      # Initialize the Playwright browser. --with-deps also pulls the OS packages
+      # Chromium itself needs, so the suite is ready for browser-backed tests too.
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      # Fast fail: make sure every module byte-compiles before running tests.
+      - name: Compile check
+        run: python -m compileall -q src run.py examples tests
+
+      - name: Run tests
+        run: pytest -q
