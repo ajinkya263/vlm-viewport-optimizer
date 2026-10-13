@@ -34,6 +34,31 @@ and the coordinates it never sees can never be wrong.
 
 ---
 
+## Why vision + DOM, not HTML scanning?
+
+There are two schools of web agents. **DOM/HTML-scanning** agents flatten the page
+to text (raw HTML or an accessibility tree) and let the model read that.
+**Vision** agents send a screenshot. This framework is a deliberate **hybrid** — it
+uses the DOM to *find* elements but renders them visually — and that combination
+beats pure HTML scanning on real-world pages:
+
+| Pure HTML/DOM scanning | This hybrid (vision + DOM) |
+|------------------------|----------------------------|
+| A real page's markup is **50k–500k+ tokens** of nested divs, inline styles, and tracking junk — often *more* than an image | The DOM is distilled to a few dozen **visible, actionable** elements (~hundreds of tokens) |
+| HTML **lies about visibility** — hidden, off-screen, or overlay-covered nodes still exist in the markup, so agents "click" invisible things | Extraction runs real `getComputedStyle` + `getBoundingClientRect` + an `elementFromPoint` **occlusion test** — covered elements are dropped |
+| **Canvas / WebGL / video** apps (Maps, Figma, charts, games) have no meaningful HTML — DOM scanning is blind | Vision sees the actual rendered pixels |
+| Flattened markup **loses spatial layout** (which label goes with which field) | The screenshot preserves real geometry |
+| Obfuscated / client-rendered markup is **fragile** | Acts on what's rendered, not on brittle selectors |
+
+**The synthesis:** the server uses the DOM to know *what* is actionable and *exactly
+where* (the registry's precise click midpoints), then shows the model only the
+minimal pixels needed to decide — **structure *and* sight**, at a fraction of the
+token cost of either extreme. Pure text/accessibility-tree agents still win on
+static, form-heavy, text-only pages; this approach wins on visual, dynamic,
+canvas-based, or scrape-hostile pages — and whenever you're driving a vision model.
+
+---
+
 ## How differential patch-rendering works
 
 This is the core optimization. After an action, we don't ask "what does the page
@@ -68,6 +93,14 @@ would register as spurious change), but the returned delta is rendered from the
 **labeled** frame — so the agent still sees the `A1`/`A2` tags *inside* the changed
 region and can act immediately.
 
+> **Honest note on where the tokens actually go.** Under both the Anthropic
+> (pixels ÷ 750) and OpenAI (512px tiles) cost models, *blacking out pixels at the
+> same resolution does not reduce the token bill* — it reduces bytes and sharpens
+> model attention, but a mostly-black full-res image still costs like a full frame.
+> So the delta is also **downscaled** (`VLM_DELTA_MAX_WIDTH`) before it's returned:
+> fewer pixels → fewer tiles → a *real* token reduction. The optimizer never claims
+> savings it can't measure — see the scorecard below.
+
 > **Verified behavior** — clicking a button that injects new DOM content returns a
 > frame where the entire viewport is black except the mutated region plus its marks.
 > Run `examples/demo_client.py` and open `dumps/03_delta.jpg` to see it for yourself.
@@ -90,6 +123,7 @@ src/vlm_optimizer/
 ├── registry.py            # isolated in-memory  mark_id → (element, midpoint)
 ├── session.py             # orchestrator — asyncio.Lock serializes view/action/zoom
 ├── manager.py             # session store + background idle reaper
+├── agent_spec.py          # function-calling tool schema + system prompt for LLMs
 │
 ├── browser/               # ══ AUTOMATION LAYER — Playwright ══
 │   ├── controller.py      #    async Chromium lifecycle · capture · dispatch
@@ -98,7 +132,8 @@ src/vlm_optimizer/
 ├── vision/                # ══ IMAGE-MATH LAYER — OpenCV / NumPy / PIL ══
 │   ├── labeler.py         #    Set-of-Mark rendering (color-coded by role)
 │   ├── delta.py           #    cv2.absdiff differential engine
-│   ├── crop.py            #    macro downscale + 512px zoom tile
+│   ├── crop.py            #    macro / delta downscale + 512px zoom tile
+│   ├── tokens.py          #    vision-token cost estimation (Anthropic / OpenAI)
 │   └── codec.py           #    BGR ndarray → compressed base64
 │
 └── api/
@@ -198,7 +233,9 @@ docker run --rm -p 8000:8000 \
 | POST   | `/session/view`   | Capture current state · `?session_id=&mode=macro\|delta`        |
 | POST   | `/session/action` | Dispatch click/type/scroll/goto by `mark_id`, return next state |
 | POST   | `/session/zoom`   | Return a 512×512 tile for one `mark_id`                          |
+| GET    | `/session/stats`  | Cumulative vision-token savings scorecard for the session       |
 | DELETE | `/session/{id}`   | Tear the session down                                           |
+| GET    | `/agent/spec`     | Ready-to-use function-calling tool schema + system prompt       |
 | GET    | `/healthz`        | Liveness + active session count                                 |
 
 ### Typical agent loop
@@ -230,6 +267,56 @@ referenced `mark_id`, so behavior matches what the model saw on the labeled fram
 
 ---
 
+## Measuring the savings (it keeps its own scorecard)
+
+Every returned frame carries an honest token estimate, and each session tracks the
+cumulative total versus a naive full-resolution loop:
+
+```jsonc
+// every ViewState includes:
+"image_width": 768, "image_height": 480,
+"estimated_vision_tokens": 492,          // what THIS frame costs
+"estimated_full_frame_tokens": 1366,     // what a naive 1280×800 screenshot costs
+"token_savings_ratio": 0.64              // 64% fewer vision tokens, this frame
+
+// GET /session/stats → the running headline metric:
+{ "frames_served": 12, "optimized_tokens_total": 5904,
+  "naive_tokens_total": 16392, "tokens_saved": 10488, "savings_ratio": 0.64 }
+```
+
+Estimates come from [`vision/tokens.py`](src/vlm_optimizer/vision/tokens.py), which
+models both the Anthropic pixel-area and OpenAI tile schemes (set
+`VLM_TOKEN_MODEL_FAMILY=openai` to switch). A typical macro+delta loop runs **~60%+
+cheaper** in vision tokens than re-sending full frames — and because it's measured,
+not asserted, you can prove it in a demo.
+
+## Plug it into a real LLM
+
+`GET /agent/spec` returns a ready-to-use **function-calling tool schema** and a
+**system prompt** — the exact artifacts Claude's `tools` API or OpenAI's function
+calling expect:
+
+```python
+spec = httpx.get("http://localhost:8000/agent/spec").json()
+# → spec["tool"]          # pass straight into the model's tools=[...]
+# → spec["system_prompt"] # teaches the perceive→decide→act loop
+```
+
+And every view can return a **token-cheap `layout_text`** instead of making the
+model parse verbose JSON — one line per element, everything it needs to act:
+
+```
+A1   link      "Learn more" @640,749
+A2   input     "Search box" @249,105
+A3   button    "Open" @423,105 [disabled]
+```
+
+The reference loop in [`examples/vlm_agent_loop.py`](examples/vlm_agent_loop.py)
+shows the full perceive→decide→act cycle; swapping the mock model for a real one is
+a single-method change.
+
+---
+
 ## Production robustness
 
 | Failure mode | Handling |
@@ -254,7 +341,9 @@ referenced `mark_id`, so behavior matches what the model saw on the labeled fram
 | `VLM_DELTA_MIN_AREA_PX` | `256` | Ignore change regions smaller than this |
 | `VLM_DELTA_DILATE_PX` | `6` | Merge nearby change clusters into one box |
 | `VLM_MACRO_MAX_WIDTH` | `768` | Macro overview downscale width |
+| `VLM_DELTA_MAX_WIDTH` | `768` | Delta downscale width — the *real* delta token saver |
 | `VLM_MACRO_JPEG_QUALITY` | `40` | Macro compression (deliberately low) |
+| `VLM_TOKEN_MODEL_FAMILY` | `anthropic` | Token cost model: `anthropic` or `openai` |
 | `VLM_CROP_TILE_SIZE` | `512` | Zoom tile size |
 | `VLM_CROP_PADDING_RATIO` | `0.15` | Zoom padding around the element |
 | `VLM_SESSION_IDLE_TTL_S` | `900` | Idle seconds before a session is reaped |

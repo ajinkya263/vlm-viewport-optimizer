@@ -66,6 +66,15 @@ class Settings(BaseSettings):
         ge=128,
         description="Width the macro (whole-viewport) frame is downscaled to.",
     )
+    delta_max_width: int = Field(
+        default=768,
+        ge=128,
+        description=(
+            "Delta frames are downscaled to at most this width. This is what makes "
+            "a delta genuinely cheaper in vision TOKENS (fewer pixels => fewer tiles), "
+            "not just in bytes — blacking out alone does not reduce tile-based token cost."
+        ),
+    )
     macro_jpeg_quality: int = Field(default=40, ge=1, le=100)
     crop_padding_ratio: float = Field(default=0.15, ge=0.0, le=1.0)
     crop_tile_size: int = Field(
@@ -74,6 +83,12 @@ class Settings(BaseSettings):
         description="Output square size for zoom tiles (OpenAI/Anthropic 512px tile grid).",
     )
     crop_jpeg_quality: int = Field(default=80, ge=1, le=100)
+
+    # ---- Token accounting ------------------------------------------------
+    token_model_family: str = Field(
+        default="anthropic",
+        description="Which vision-token cost model to estimate against: 'anthropic' or 'openai'.",
+    )
 
     # ---- Session lifecycle ----------------------------------------------
     session_idle_ttl_s: int = Field(

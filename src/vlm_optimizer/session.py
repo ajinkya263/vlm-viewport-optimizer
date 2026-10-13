@@ -23,12 +23,21 @@ from .config import settings
 from .models import (
     ActionRequest,
     ActionType,
+    BoundingBox,
     InteractableElement,
+    SessionStats,
     ViewMode,
     ViewState,
+    compact_layout,
 )
 from .registry import MarkRegistry
-from .vision import DeltaEngine, SetOfMarkLabeler, ViewportCropper
+from .vision import (
+    DeltaEngine,
+    SetOfMarkLabeler,
+    ViewportCropper,
+    estimate_vision_tokens,
+    savings_ratio,
+)
 from .vision.codec import encode_base64
 
 
@@ -45,6 +54,10 @@ class Session:
         self._lock = asyncio.Lock()
         self._last_used: float = time.monotonic()
         self._started = False
+        # Cumulative token-savings accounting (the headline optimization metric).
+        self._frames_served = 0
+        self._optimized_tokens = 0
+        self._naive_tokens = 0
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -76,13 +89,15 @@ class Session:
     # ------------------------------------------------------------------ #
     # View
     # ------------------------------------------------------------------ #
-    async def view(self, mode: ViewMode = ViewMode.MACRO) -> ViewState:
+    async def view(
+        self, mode: ViewMode = ViewMode.MACRO, *, include_layout_text: bool = True
+    ) -> ViewState:
         """Capture the current page and return it in the requested representation."""
         async with self._lock:
             self._touch()
-            return await self._capture_and_render(mode)
+            return await self._capture_and_render(mode, include_layout_text)
 
-    async def zoom(self, mark_id: str) -> ViewState:
+    async def zoom(self, mark_id: str, *, include_layout_text: bool = True) -> ViewState:
         """Return a single 512x512 zoom tile centered on one element.
 
         Resolves the mark against the registry captured on the *last* view, so a
@@ -97,19 +112,14 @@ class Session:
             self._registry.rebuild(elements)
 
             tile = await asyncio.to_thread(self._cropper.zoom, frame, element.bbox)
-            b64 = await asyncio.to_thread(
-                encode_base64, tile, fmt="jpeg", jpeg_quality=settings.crop_jpeg_quality
-            )
-            h, w = tile.shape[:2]
-            return ViewState(
-                session_id=self.session_id,
+            return await self._build_state(
+                frame=tile,
                 mode=ViewMode.ZOOM,
+                elements=[element],
                 url=url,
                 title=title,
-                image_base64=b64,
-                image_width=w,
-                image_height=h,
-                elements=[element],
+                jpeg_quality=settings.crop_jpeg_quality,
+                include_layout_text=include_layout_text,
                 note=f"Zoom tile for mark '{element.mark_id}'.",
             )
 
@@ -139,12 +149,30 @@ class Session:
                 dy=request.dy,
                 clear_first=request.clear_first,
             )
-            return await self._capture_and_render(request.return_mode)
+            return await self._capture_and_render(request.return_mode, include_layout_text=True)
+
+    # ------------------------------------------------------------------ #
+    # Stats
+    # ------------------------------------------------------------------ #
+    def stats(self) -> SessionStats:
+        """Return the cumulative token-savings scorecard for this session."""
+        saved = max(0, self._naive_tokens - self._optimized_tokens)
+        return SessionStats(
+            session_id=self.session_id,
+            frames_served=self._frames_served,
+            optimized_tokens_total=self._optimized_tokens,
+            naive_tokens_total=self._naive_tokens,
+            tokens_saved=saved,
+            savings_ratio=savings_ratio(self._optimized_tokens, self._naive_tokens),
+            model_family=settings.token_model_family,
+        )
 
     # ------------------------------------------------------------------ #
     # Internal capture+render pipeline (lock already held)
     # ------------------------------------------------------------------ #
-    async def _capture_and_render(self, mode: ViewMode) -> ViewState:
+    async def _capture_and_render(
+        self, mode: ViewMode, include_layout_text: bool
+    ) -> ViewState:
         frame, elements, url, title = await self._controller.capture()
         self._registry.rebuild(elements)
 
@@ -154,15 +182,17 @@ class Session:
         labeled = await asyncio.to_thread(self._labeler.render, frame, elements)
 
         if mode is ViewMode.DELTA and delta.changed and delta.region is not None:
-            return await self._render_delta(labeled, delta.region, elements, url, title)
+            return await self._render_delta(
+                labeled, delta.region, elements, url, title, include_layout_text
+            )
         if mode is ViewMode.DELTA:
             # Nothing changed (or first frame) — degrade to a full macro overview.
             return await self._render_macro(
-                labeled, elements, url, title,
+                labeled, elements, url, title, include_layout_text,
                 note="No significant change detected; returning full macro frame.",
             )
         # MACRO (and ZOOM is handled by .zoom()).
-        return await self._render_macro(labeled, elements, url, title)
+        return await self._render_macro(labeled, elements, url, title, include_layout_text)
 
     async def _render_macro(
         self,
@@ -170,38 +200,36 @@ class Session:
         elements: list[InteractableElement],
         url: str,
         title: str,
+        include_layout_text: bool,
         note: str = "",
     ) -> ViewState:
         macro = await asyncio.to_thread(self._cropper.macro, labeled)
-        b64 = await asyncio.to_thread(
-            encode_base64, macro.frame, fmt="jpeg", jpeg_quality=settings.macro_jpeg_quality
-        )
-        h, w = macro.frame.shape[:2]
-        return ViewState(
-            session_id=self.session_id,
+        return await self._build_state(
+            frame=macro.frame,
             mode=ViewMode.MACRO,
+            elements=elements,
             url=url,
             title=title,
-            image_base64=b64,
-            image_width=w,
-            image_height=h,
-            elements=elements,
+            jpeg_quality=settings.macro_jpeg_quality,
+            include_layout_text=include_layout_text,
             note=note,
         )
 
     async def _render_delta(
         self,
         labeled: np.ndarray,
-        region,
+        region: BoundingBox,
         elements: list[InteractableElement],
         url: str,
         title: str,
+        include_layout_text: bool,
     ) -> ViewState:
         masked = await asyncio.to_thread(self._delta._mask_outside, labeled, region)
-        b64 = await asyncio.to_thread(
-            encode_base64, masked, fmt="jpeg", jpeg_quality=settings.crop_jpeg_quality
+        # Downscale the masked frame: this is what makes a delta cheaper in TOKENS
+        # (fewer pixels => fewer tiles), not merely cheaper in bytes.
+        shrunk = await asyncio.to_thread(
+            self._cropper.downscale_to, masked, settings.delta_max_width
         )
-        h, w = masked.shape[:2]
         # Only report elements whose center falls inside the changed region — the
         # agent shouldn't try to click something it (deliberately) cannot see.
         rx, ry, rw, rh = region.to_xywh_int()
@@ -210,15 +238,63 @@ class Session:
             for el in elements
             if rx <= el.center[0] <= rx + rw and ry <= el.center[1] <= ry + rh
         ]
+        return await self._build_state(
+            frame=shrunk.frame,
+            mode=ViewMode.DELTA,
+            elements=visible,
+            url=url,
+            title=title,
+            jpeg_quality=settings.crop_jpeg_quality,
+            include_layout_text=include_layout_text,
+            change_region=region,
+            note=f"Delta frame: {len(visible)} marks inside the changed region.",
+        )
+
+    # ------------------------------------------------------------------ #
+    # Shared finalizer: encode, estimate tokens, accumulate savings
+    # ------------------------------------------------------------------ #
+    async def _build_state(
+        self,
+        *,
+        frame: np.ndarray,
+        mode: ViewMode,
+        elements: list[InteractableElement],
+        url: str,
+        title: str,
+        jpeg_quality: int,
+        include_layout_text: bool,
+        change_region: BoundingBox | None = None,
+        note: str = "",
+    ) -> ViewState:
+        b64 = await asyncio.to_thread(
+            encode_base64, frame, fmt="jpeg", jpeg_quality=jpeg_quality
+        )
+        h, w = frame.shape[:2]
+        family = settings.token_model_family
+
+        optimized = estimate_vision_tokens(w, h, family=family)
+        naive = estimate_vision_tokens(
+            settings.viewport_width, settings.viewport_height, family=family
+        )
+        # Accumulate the session scorecard: every frame we serve is one frame a
+        # naive full-resolution loop would also have served.
+        self._frames_served += 1
+        self._optimized_tokens += optimized
+        self._naive_tokens += naive
+
         return ViewState(
             session_id=self.session_id,
-            mode=ViewMode.DELTA,
+            mode=mode,
             url=url,
             title=title,
             image_base64=b64,
             image_width=w,
             image_height=h,
-            elements=visible,
-            change_region=region,
-            note=f"Delta frame: {len(visible)} marks inside the changed region.",
+            elements=elements,
+            layout_text=compact_layout(elements) if include_layout_text else None,
+            change_region=change_region,
+            estimated_vision_tokens=optimized,
+            estimated_full_frame_tokens=naive,
+            token_savings_ratio=savings_ratio(optimized, naive),
+            note=note,
         )
