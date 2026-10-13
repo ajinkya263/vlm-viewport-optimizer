@@ -21,10 +21,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Path, Query, Request
 from fastapi.responses import JSONResponse
 
+from ..agent_spec import agent_spec
 from ..errors import VLMOptimizerError
 from ..manager import SessionManager
 from ..models import (
     ActionRequest,
+    SessionStats,
     StartSessionRequest,
     StartSessionResponse,
     ViewMode,
@@ -68,6 +70,14 @@ def create_app() -> FastAPI:
     async def healthz(request: Request) -> dict[str, object]:
         return {"status": "ok", "active_sessions": _manager(request).count}
 
+    @app.get("/agent/spec", tags=["agent"])
+    async def get_agent_spec() -> dict[str, object]:
+        """Return a ready-to-use function-calling tool schema + system prompt.
+
+        Point Claude or GPT at this to wire the agent up with zero guesswork.
+        """
+        return agent_spec()
+
     # ------------------------------------------------------------------ #
     @app.post("/session/start", response_model=StartSessionResponse, tags=["session"])
     async def start_session(
@@ -86,9 +96,12 @@ def create_app() -> FastAPI:
         mode: ViewMode = Query(
             ViewMode.MACRO, description="macro = full overview, delta = changed region only."
         ),
+        include_layout_text: bool = Query(
+            True, description="Attach the token-cheap one-line-per-element layout."
+        ),
     ) -> ViewState:
         session = await _manager(request).get(session_id)
-        return await session.view(mode)
+        return await session.view(mode, include_layout_text=include_layout_text)
 
     # ------------------------------------------------------------------ #
     @app.post("/session/action", response_model=ViewState, tags=["session"])
@@ -109,6 +122,16 @@ def create_app() -> FastAPI:
     ) -> ViewState:
         session = await _manager(request).get(session_id)
         return await session.zoom(body.mark_id)
+
+    # ------------------------------------------------------------------ #
+    @app.get("/session/stats", response_model=SessionStats, tags=["session"])
+    async def session_stats(
+        request: Request,
+        session_id: str = Query(..., description="Session returned by /session/start."),
+    ) -> SessionStats:
+        """Cumulative vision-token savings vs. a naive full-frame loop."""
+        session = await _manager(request).get(session_id)
+        return session.stats()
 
     # ------------------------------------------------------------------ #
     @app.delete("/session/{session_id}", tags=["session"])

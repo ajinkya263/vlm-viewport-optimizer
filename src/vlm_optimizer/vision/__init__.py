@@ -10,6 +10,7 @@ from .codec import encode_base64
 from .crop import ViewportCropper
 from .delta import DeltaEngine, DeltaResult
 from .labeler import SetOfMarkLabeler
+from .tokens import estimate_vision_tokens, savings_ratio
 
 __all__ = [
     "SetOfMarkLabeler",
@@ -17,4 +18,6 @@ __all__ = [
     "DeltaResult",
     "ViewportCropper",
     "encode_base64",
+    "estimate_vision_tokens",
+    "savings_ratio",
 ]

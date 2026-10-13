@@ -57,6 +57,28 @@ class InteractableElement(BaseModel):
     enabled: bool = True
 
 
+def compact_layout(elements: list["InteractableElement"]) -> str:
+    """Serialize elements to a terse, token-cheap layout block for the LLM.
+
+    One line per element, e.g.::
+
+        A1  link      "Learn more" @67,105
+        A2  input     "Search box" @249,105
+        A3  button    "Open" @423,105 [disabled]
+
+    This is markedly cheaper in tokens than the full JSON (no keys, braces, or
+    quotes repeated per field) while preserving everything an agent needs to act:
+    the mark id, the role, the accessible name, and the click midpoint.
+    """
+    lines: list[str] = []
+    for el in elements:
+        cx, cy = (round(c) for c in el.center)
+        name = f'"{el.name}"' if el.name else '""'
+        flag = "" if el.enabled else " [disabled]"
+        lines.append(f"{el.mark_id:<4} {el.role:<9} {name} @{cx},{cy}{flag}")
+    return "\n".join(lines)
+
+
 class ViewMode(StrEnum):
     MACRO = "macro"
     """Whole-viewport, heavily compressed, labeled overview."""
@@ -78,10 +100,42 @@ class ViewState(BaseModel):
     image_width: int
     image_height: int
     elements: list[InteractableElement] = Field(default_factory=list)
+    layout_text: str | None = Field(
+        default=None,
+        description=(
+            "Token-efficient one-line-per-element layout the LLM can read instead of "
+            "the verbose `elements` JSON. Omitted unless requested."
+        ),
+    )
     change_region: BoundingBox | None = Field(
         default=None, description="Populated in DELTA mode: the box that changed."
     )
+    estimated_vision_tokens: int = Field(
+        default=0, description="Estimated vision tokens THIS frame costs the model."
+    )
+    estimated_full_frame_tokens: int = Field(
+        default=0,
+        description="What a naive full-resolution viewport screenshot would have cost.",
+    )
+    token_savings_ratio: float = Field(
+        default=0.0, description="Fraction of vision tokens saved vs. the naive full frame."
+    )
     note: str = Field(default="", description="Human-readable diagnostics (fallbacks, etc).")
+
+
+class SessionStats(BaseModel):
+    """Cumulative optimization scorecard for a session — the headline metric."""
+
+    # 'model_family' would otherwise collide with Pydantic's protected 'model_' namespace.
+    model_config = ConfigDict(protected_namespaces=())
+
+    session_id: str
+    frames_served: int
+    optimized_tokens_total: int = Field(description="Vision tokens actually spent.")
+    naive_tokens_total: int = Field(description="Vision tokens a full-frame loop would spend.")
+    tokens_saved: int
+    savings_ratio: float = Field(description="Overall fraction of vision tokens saved.")
+    model_family: str
 
 
 # --------------------------------------------------------------------------

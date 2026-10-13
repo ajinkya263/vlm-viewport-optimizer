@@ -8,10 +8,16 @@ from __future__ import annotations
 
 import numpy as np
 
-from vlm_optimizer.models import BoundingBox, ElementRole, InteractableElement
+from vlm_optimizer.models import (
+    BoundingBox,
+    ElementRole,
+    InteractableElement,
+    compact_layout,
+)
 from vlm_optimizer.registry import MarkRegistry, generate_mark_id
 from vlm_optimizer.vision import DeltaEngine, SetOfMarkLabeler, ViewportCropper
 from vlm_optimizer.vision.codec import encode_base64
+from vlm_optimizer.vision.tokens import estimate_vision_tokens, savings_ratio
 
 
 def _frame(h: int = 400, w: int = 600, fill: int = 30) -> np.ndarray:
@@ -100,3 +106,39 @@ def test_codec_roundtrip_is_base64() -> None:
     b64 = encode_base64(_frame(), fmt="jpeg", jpeg_quality=50)
     assert isinstance(b64, str)
     assert base64.b64decode(b64)  # decodes without error
+
+
+def test_token_estimate_scales_with_pixels() -> None:
+    # Anthropic: ~pixels/750. A downscaled frame must cost strictly fewer tokens.
+    full = estimate_vision_tokens(1280, 800, family="anthropic")
+    macro = estimate_vision_tokens(768, 480, family="anthropic")
+    assert full == 1366 and macro < full
+    # OpenAI tile model: fewer pixels => fewer 512px tiles => fewer tokens.
+    assert estimate_vision_tokens(512, 512, family="openai") < estimate_vision_tokens(
+        1280, 800, family="openai"
+    )
+
+
+def test_savings_ratio_bounds() -> None:
+    assert savings_ratio(500, 1000) == 0.5
+    assert savings_ratio(0, 1000) == 1.0
+    assert savings_ratio(2000, 1000) == 0.0  # clamped, never negative
+    assert savings_ratio(10, 0) == 0.0  # no baseline => no claimed savings
+
+
+def test_compact_layout_is_terse_and_complete() -> None:
+    els = [
+        _element("A1", 60, 100),
+        InteractableElement(
+            mark_id="A2", role=ElementRole.LINK, tag="a", name="Next",
+            enabled=False, bbox=BoundingBox(x=10, y=10, width=40, height=20),
+            center=(30, 20),
+        ),
+    ]
+    text = compact_layout(els)
+    lines = text.splitlines()
+    assert len(lines) == 2
+    assert "A1" in lines[0] and "@" in lines[0]
+    assert "[disabled]" in lines[1]  # disabled flag surfaced
+    # Far fewer characters than the equivalent JSON dump.
+    assert len(text) < len(str([e.model_dump() for e in els]))

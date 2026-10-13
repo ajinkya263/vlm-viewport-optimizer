@@ -47,11 +47,20 @@ class ViewportCropper:
     # ------------------------------------------------------------------ #
     def macro(self, frame: np.ndarray) -> MacroFrame:
         """Downscale ``frame`` to at most ``macro_max_width`` wide (never upscales)."""
+        return self.downscale_to(frame, self._macro_w)
+
+    @staticmethod
+    def downscale_to(frame: np.ndarray, max_width: int) -> MacroFrame:
+        """Downscale ``frame`` so its width is at most ``max_width`` (never upscales).
+
+        Used by both the macro overview and delta frames: fewer pixels is what
+        actually lowers vision-token cost under pixel-area / tile pricing.
+        """
         h, w = frame.shape[:2]
-        if w <= self._macro_w:
+        if w <= max_width:
             return MacroFrame(frame=frame, scale=1.0)
-        scale = self._macro_w / float(w)
-        new_size = (self._macro_w, max(1, round(h * scale)))
+        scale = max_width / float(w)
+        new_size = (max_width, max(1, round(h * scale)))
         small = cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
         return MacroFrame(frame=small, scale=scale)
 
